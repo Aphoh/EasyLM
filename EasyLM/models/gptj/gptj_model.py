@@ -15,36 +15,37 @@
 # limitations under the License.
 
 
-from functools import partial
-from typing import Optional, Tuple
 import json
-
-import numpy as np
+from functools import partial
+from typing import List, Optional, Tuple, Union
 
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import numpy as np
+from EasyLM.jax_utils import get_gradient_checkpoint_policy, get_jax_mesh
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
+from flax.linen import partitioning as nn_partitioning
 from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
-from flax.linen import partitioning as nn_partitioning
-
-from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
-from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel, append_call_sample_docstring
-from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging
-from transformers.generation.flax_logits_process import FlaxLogitsProcessorList
-from transformers import AutoTokenizer
 from jax.sharding import PartitionSpec
-
 from ml_collections import ConfigDict
-from ml_collections.config_dict import config_dict
 from mlxu import function_args_to_config, load_pickle, open_file
-
-from EasyLM.jax_utils import (
-    with_sharding_constraint, get_jax_mesh, get_gradient_checkpoint_policy
+from transformers import AutoTokenizer
+from transformers.configuration_utils import PretrainedConfig
+from transformers.generation.flax_logits_process import FlaxLogitsProcessorList
+from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
+from transformers.modeling_flax_utils import (
+    ACT2FN,
+    FlaxPreTrainedModel,
+    append_call_sample_docstring,
+)
+from transformers.utils import (
+    add_start_docstrings,
+    add_start_docstrings_to_model_forward,
+    logging,
 )
 
 
@@ -56,7 +57,7 @@ and modified to work with EasyLM.
 
 
 GPTJ_STANDARD_CONFIGS = {
-    '6b': {
+    "6b": {
         "vocab_size": 50400,
         "n_positions": 2048,
         "n_embd": 4096,
@@ -128,6 +129,7 @@ class GPTJConfig(PretrainedConfig):
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```"""
+
     model_type = "gptj"
     attribute_map = {
         "max_position_embeddings": "n_positions",
@@ -157,11 +159,11 @@ class GPTJConfig(PretrainedConfig):
         eos_token_id=50256,
         tie_word_embeddings=False,
         gradient_checkpointing=True,
-        gradient_checkpointing_policy='nothing_saveable',
+        gradient_checkpointing_policy="nothing_saveable",
         n_real_tokens=50257,
         fcm_min_ratio=0.0,
         fcm_max_ratio=0.0,
-        **kwargs
+        **kwargs,
     ):
         self.vocab_size = vocab_size
         self.n_positions = n_positions
@@ -190,7 +192,10 @@ class GPTJConfig(PretrainedConfig):
         self.eos_token_id = eos_token_id
 
         super().__init__(
-            bos_token_id=bos_token_id, eos_token_id=eos_token_id, tie_word_embeddings=tie_word_embeddings, **kwargs
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs,
         )
 
     @classmethod
@@ -208,52 +213,49 @@ class GPTJConfig(PretrainedConfig):
 
     @staticmethod
     def get_jax_mesh(axis_dims):
-        return get_jax_mesh(axis_dims, ('dp', 'fsdp', 'mp'))
+        return get_jax_mesh(axis_dims, ("dp", "fsdp", "mp"))
 
     @staticmethod
     def get_partition_rules():
-        """ Parition rules for GPTJ. Note that these rules are orderd, so that
-            the beginning rules match first. It is important to use
-            PartitionSpec() instead of None here because JAX does not treat
-            None as a pytree leaf.
+        """Parition rules for GPTJ. Note that these rules are orderd, so that
+        the beginning rules match first. It is important to use
+        PartitionSpec() instead of None here because JAX does not treat
+        None as a pytree leaf.
         """
         return (
-            ('transformer/wte/embedding', PartitionSpec('mp', 'fsdp')),
-            ('attn/(k_proj|q_proj|v_proj)/kernel', PartitionSpec('fsdp', 'mp')),
-            ('attn/out_proj/kernel', PartitionSpec('mp', 'fsdp')),
-            ('mlp/fc_in/kernel', PartitionSpec('fsdp', 'mp')),
-            ('mlp/fc_in/bias', PartitionSpec('mp')),
-            ('mlp/fc_out/kernel', PartitionSpec('mp', 'fsdp')),
-            ('mlp/fc_out/bias', PartitionSpec()),
-            ('ln_[0-9]+/bias', PartitionSpec()),
-            ('[0-9]+/ln_[0-9]+/scale', PartitionSpec()),
-            ('ln_f/bias', PartitionSpec()),
-            ('ln_f/scale', PartitionSpec()),
-            ('lm_head/kernel', PartitionSpec('fsdp', 'mp')),
-            ('lm_head/bias', PartitionSpec('mp')),
-            ('.*', PartitionSpec()),
+            ("transformer/wte/embedding", PartitionSpec("mp", "fsdp")),
+            ("attn/(k_proj|q_proj|v_proj)/kernel", PartitionSpec("fsdp", "mp")),
+            ("attn/out_proj/kernel", PartitionSpec("mp", "fsdp")),
+            ("mlp/fc_in/kernel", PartitionSpec("fsdp", "mp")),
+            ("mlp/fc_in/bias", PartitionSpec("mp")),
+            ("mlp/fc_out/kernel", PartitionSpec("mp", "fsdp")),
+            ("mlp/fc_out/bias", PartitionSpec()),
+            ("ln_[0-9]+/bias", PartitionSpec()),
+            ("[0-9]+/ln_[0-9]+/scale", PartitionSpec()),
+            ("ln_f/bias", PartitionSpec()),
+            ("ln_f/scale", PartitionSpec()),
+            ("lm_head/kernel", PartitionSpec("fsdp", "mp")),
+            ("lm_head/bias", PartitionSpec("mp")),
+            (".*", PartitionSpec()),
         )
 
     @staticmethod
     def get_weight_decay_exclusions():
-        return (
-            'ln_[0-9]+/bias', 'ln_[0-9]+/scale', 'ln_f/bias', 'ln_f/scale',
-            'bias'
-        )
+        return ("ln_[0-9]+/bias", "ln_[0-9]+/scale", "ln_f/bias", "ln_f/scale", "bias")
 
     @staticmethod
     def rng_keys():
-        return ('params', 'dropout', 'fcm')
+        return ("params", "dropout", "fcm")
 
     @staticmethod
     def get_tokenizer_config(updates=None):
         config = ConfigDict()
-        config.name = 'EleutherAI/gpt-j-6B'
-        config.bos_token = '<|endoftext|>'
-        config.eos_token = '<|endoftext|>'
-        config.pad_token = '<|extratoken_40|>'
-        config.cls_token = '<|extratoken_41|>'
-        config.mask_token = '<|extratoken_42|>'
+        config.name = "EleutherAI/gpt-j-6B"
+        config.bos_token = "<|endoftext|>"
+        config.eos_token = "<|endoftext|>"
+        config.pad_token = "<|extratoken_40|>"
+        config.cls_token = "<|extratoken_41|>"
+        config.mask_token = "<|extratoken_42|>"
 
         if updates is not None:
             config.update(ConfigDict(updates).copy_and_resolve_references())
@@ -261,10 +263,10 @@ class GPTJConfig(PretrainedConfig):
         return config
 
     @classmethod
-    def get_tokenizer(cls, config, padding_side='left', truncation_side='right'):
+    def get_tokenizer(cls, config, padding_side="left", truncation_side="right"):
         config = cls.get_tokenizer_config(config)
         return AutoTokenizer.from_pretrained(
-            config.name,
+            config.name,  # type: ignore
             bos_token=config.bos_token,
             eos_token=config.eos_token,
             pad_token=config.pad_token,
@@ -280,24 +282,24 @@ class GPTJConfig(PretrainedConfig):
             params = FlaxGPTJForCausalLM.from_pretrained(
                 name, _do_init=False, dtype=dtype
             )[1]
-            params = freeze({'params': params})
+            params = freeze({"params": params})
         return jax.device_get(params)
 
     @classmethod
     def load_config(cls, path):
         if path in GPTJ_STANDARD_CONFIGS:
             return cls.from_dict(GPTJ_STANDARD_CONFIGS[path])
-        load_type, load_path = path.split('::', 1)
-        if load_type == 'pickle':
-            return cls.from_dict(load_pickle(load_path)['gptj_config'])
-        elif load_type == 'json':
-            with open_file(load_path, 'r') as fin:
+        load_type, load_path = path.split("::", 1)
+        if load_type == "pickle":
+            return cls.from_dict(load_pickle(load_path)["gptj_config"])
+        elif load_type == "json":
+            with open_file(load_path, "r") as fin:
                 raw_config = fin.read()
             return cls.from_dict(json.loads(raw_config))
-        elif load_type == 'huggingface':
+        elif load_type == "huggingface":
             return cls.from_pretrained(load_path)
         else:
-            raise ValueError(f'Unsupported load config type: {load_type}')
+            raise ValueError(f"Unsupported load config type: {load_type}")
 
 
 """
@@ -370,10 +372,11 @@ GPTJ_INPUTS_DOCSTRING = r"""
 """
 
 
-
 def create_sinusoidal_positions(num_pos, dim):
     inv_freq = 1.0 / (10000 ** (np.arange(0, dim, 2) / dim))
-    sinusoid_inp = np.einsum("i , j -> i j", np.arange(num_pos), inv_freq).astype("float32")
+    sinusoid_inp = np.einsum("i , j -> i j", np.arange(num_pos), inv_freq).astype(
+        "float32"
+    )
     sin, cos = np.sin(sinusoid_inp), np.cos(sinusoid_inp)
 
     sentinel = dim // 2 + dim % 2
@@ -385,8 +388,12 @@ def create_sinusoidal_positions(num_pos, dim):
 
 
 def rotate_every_two(tensor):
-    rotate_half_tensor = jnp.stack((-tensor[:, :, :, 1::2], tensor[:, :, :, ::2]), axis=-1)
-    rotate_half_tensor = rotate_half_tensor.reshape(rotate_half_tensor.shape[:-2] + (-1,))
+    rotate_half_tensor = jnp.stack(
+        (-tensor[:, :, :, 1::2], tensor[:, :, :, ::2]), axis=-1
+    )
+    rotate_half_tensor = rotate_half_tensor.reshape(
+        rotate_half_tensor.shape[:-2] + (-1,)
+    )
     return rotate_half_tensor
 
 
@@ -417,9 +424,10 @@ class FlaxGPTJAttention(nn.Module):
             use_bias=False,
             dtype=self.dtype,
             kernel_init=jax.nn.initializers.variance_scaling(
-                scale=1.0, mode='fan_in',
-                distribution='normal',
-            )
+                scale=1.0,
+                mode="fan_in",
+                distribution="normal",
+            ),
         )
 
         self.q_proj, self.k_proj, self.v_proj = dense(), dense(), dense()
@@ -427,16 +435,22 @@ class FlaxGPTJAttention(nn.Module):
 
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
 
-        self.causal_mask = make_causal_mask(jnp.ones((1, config.max_position_embeddings), dtype="bool"), dtype="bool")
+        self.causal_mask = make_causal_mask(
+            jnp.ones((1, config.max_position_embeddings), dtype="bool"), dtype="bool"
+        )
 
         if self.rotary_dim is not None and self.rotary_dim > 0:
             pos_embd_dim = self.rotary_dim
         else:
             pos_embd_dim = self.embed_dim // self.num_heads
-        self.embed_positions = create_sinusoidal_positions(config.max_position_embeddings, pos_embd_dim)
+        self.embed_positions = create_sinusoidal_positions(
+            config.max_position_embeddings, pos_embd_dim
+        )
 
     def _split_heads(self, hidden_states):
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
+        return hidden_states.reshape(
+            hidden_states.shape[:2] + (self.num_heads, self.head_dim)
+        )
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
@@ -450,9 +464,15 @@ class FlaxGPTJAttention(nn.Module):
         """
         # detect if we're initializing by absence of existing cache data.
         is_initialized = self.has_variable("cache", "cached_key")
-        cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
-        cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
-        cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
+        cached_key = self.variable(
+            "cache", "cached_key", jnp.zeros, key.shape, key.dtype
+        )
+        cached_value = self.variable(
+            "cache", "cached_value", jnp.zeros, value.shape, value.dtype
+        )
+        cache_index = self.variable(
+            "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
+        )
 
         if is_initialized:
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
@@ -483,7 +503,6 @@ class FlaxGPTJAttention(nn.Module):
         output_attentions: bool = False,
         fcm_mask=None,
     ):
-
         query = self.q_proj(hidden_states)
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
@@ -492,8 +511,8 @@ class FlaxGPTJAttention(nn.Module):
         key = self._split_heads(key)
         value = self._split_heads(value)
 
-        sincos = jnp.take(self.embed_positions, position_ids, axis=0)
-        sincos = jnp.split(sincos, 2, axis=-1)
+        sincos_ls = jnp.take(self.embed_positions, position_ids, axis=0)
+        sincos = jnp.split(sincos_ls, 2, axis=-1)
         # Rotary position embeddings induce some weird issues in multi-host environments, so we remove activation-sharding for keys/query vectors to fix this.
         # key = with_sharding_constraint(key, PartitionSpec("dp", None, None, None))
         # query = with_sharding_constraint(query, PartitionSpec("dp", None, None, None))
@@ -519,15 +538,21 @@ class FlaxGPTJAttention(nn.Module):
             mask_shift = self.variables["cache"]["cache_index"]
             max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
             causal_mask = lax.dynamic_slice(
-                self.causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
+                self.causal_mask,
+                (0, 0, mask_shift, 0),
+                (1, 1, query_length, max_decoder_length),
             )
         else:
             causal_mask = self.causal_mask[:, :, :query_length, :key_length]
 
         batch_size = hidden_states.shape[0]
-        causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
+        causal_mask = jnp.broadcast_to(
+            causal_mask, (batch_size,) + causal_mask.shape[1:]
+        )
 
-        attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
+        attention_mask = jnp.broadcast_to(
+            jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape
+        )
         if self.causal:
             attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
         else:
@@ -540,7 +565,9 @@ class FlaxGPTJAttention(nn.Module):
         # During fast autoregressive decoding, we feed one position at a time,
         # and cache the keys and values step by step.
         if self.has_variable("cache", "cached_key") or init_cache:
-            key, value, attention_mask = self._concatenate_to_cache(key, value, query, attention_mask)
+            key, value, attention_mask = self._concatenate_to_cache(
+                key, value, query, attention_mask
+            )
 
         # transform boolean mask into float mask
         attention_bias = lax.select(
@@ -577,12 +604,15 @@ class FlaxGPTJMLP(nn.Module):
 
     def setup(self):
         embed_dim = self.config.hidden_size
-        kernel_init=jax.nn.initializers.variance_scaling(
-            scale=1.0, mode='fan_in',
-            distribution='normal',
+        kernel_init = jax.nn.initializers.variance_scaling(
+            scale=1.0,
+            mode="fan_in",
+            distribution="normal",
         )
 
-        self.fc_in = nn.Dense(self.intermediate_size, dtype=self.dtype, kernel_init=kernel_init)
+        self.fc_in = nn.Dense(
+            self.intermediate_size, dtype=self.dtype, kernel_init=kernel_init
+        )
         self.fc_out = nn.Dense(embed_dim, dtype=self.dtype, kernel_init=kernel_init)
 
         self.act = ACT2FN[self.config.activation_function]
@@ -602,11 +632,13 @@ class FlaxGPTJBlock(nn.Module):
 
     def setup(self):
         hidden_size = self.config.hidden_size
-        inner_dim = self.config.n_inner if self.config.n_inner is not None else 4 * hidden_size
+        inner_dim = (
+            self.config.n_inner if self.config.n_inner is not None else 4 * hidden_size
+        )
 
         self.ln_1 = nn.LayerNorm(
             epsilon=self.config.layer_norm_epsilon,
-            dtype=jnp.promote_types(self.dtype, jnp.float32)
+            dtype=jnp.promote_types(self.dtype, jnp.float32),
         )
         self.attn = FlaxGPTJAttention(self.config, dtype=self.dtype)
 
@@ -635,7 +667,9 @@ class FlaxGPTJBlock(nn.Module):
         )
         attn_output = attn_outputs[0]
 
-        feed_forward_hidden_states = self.mlp(hidden_states, deterministic=deterministic)
+        feed_forward_hidden_states = self.mlp(
+            hidden_states, deterministic=deterministic
+        )
         # residual connection
         hidden_states = attn_output + feed_forward_hidden_states + residual
 
@@ -650,7 +684,7 @@ class FlaxGPTJPreTrainedModel(FlaxPreTrainedModel):
 
     config_class = GPTJConfig
     base_model_prefix = "transformer"
-    module_class: nn.Module = None
+    module_class: Optional[type[nn.Module]] = None
 
     def __init__(
         self,
@@ -661,14 +695,29 @@ class FlaxGPTJPreTrainedModel(FlaxPreTrainedModel):
         _do_init: bool = True,
         **kwargs,
     ):
+        assert self.module_class is not None, "module_class is not defined"
         module = self.module_class(config=config, dtype=dtype, **kwargs)
-        super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
+        super().__init__(
+            config,
+            module,
+            input_shape=input_shape,
+            seed=seed,
+            dtype=dtype,
+            _do_init=_do_init,
+        )
 
-    def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
+    def init_weights(
+        self,
+        rng: jax.Array,
+        input_shape: Tuple,
+        params: Optional[FrozenDict] = None,
+    ) -> FrozenDict:
         # init input tensors
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape)
+        position_ids = jnp.broadcast_to(
+            jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape
+        )
         params_rng, dropout_rng = jax.random.split(rng)
         rngs = {"params": params_rng, "dropout": dropout_rng}
 
@@ -685,16 +734,18 @@ class FlaxGPTJPreTrainedModel(FlaxPreTrainedModel):
                 return_dict=False,
             )
         else:
-            module_init_outputs = self.module.init(rngs, input_ids, attention_mask, position_ids, return_dict=False)
+            module_init_outputs = self.module.init(
+                rngs, input_ids, attention_mask, position_ids, return_dict=False
+            )
 
         random_params = module_init_outputs["params"]
 
         if params is not None:
             random_params = flatten_dict(unfreeze(random_params))
-            params = flatten_dict(unfreeze(params))
-            for missing_key in self._missing_keys:
-                params[missing_key] = random_params[missing_key]
-            self._missing_keys = set()
+            params = flatten_dict(unfreeze(params))  # type: ignore
+            for missing_key in self._missing_keys:  # type: ignore
+                params[missing_key] = random_params[missing_key]  # type: ignore
+            self._missing_keys = set()  # type: ignore
             return freeze(unflatten_dict(params))
         else:
             return random_params
@@ -711,17 +762,25 @@ class FlaxGPTJPreTrainedModel(FlaxPreTrainedModel):
         # init input variables to retrieve cache
         input_ids = jnp.ones((batch_size, max_length))
         attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
+        position_ids = jnp.broadcast_to(
+            jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape
+        )
 
         init_variables = self.module.init(
-            jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
+            jax.random.PRNGKey(0),
+            input_ids,
+            attention_mask,
+            position_ids,
+            return_dict=False,
+            init_cache=True,
         )
         return init_variables["cache"]
 
-    def _get_logits_processor(self,*args, **kwargs) -> FlaxLogitsProcessorList:
+    def _get_logits_processor(self, *args, **kwargs) -> FlaxLogitsProcessorList:
         processors = super()._get_logits_processor(*args, **kwargs)
+
         def squash_extra_tokens(input_ids, scores, cur_len):
-            return scores.at[:, self.config.n_real_tokens:].set(-float('inf'))
+            return scores.at[:, self.config.n_real_tokens :].set(-float("inf"))
 
         processors.append(squash_extra_tokens)
         return processors
@@ -732,27 +791,39 @@ class FlaxGPTJPreTrainedModel(FlaxPreTrainedModel):
         input_ids,
         attention_mask=None,
         position_ids=None,
-        params: dict = None,
-        past_key_values: dict = None,
-        dropout_rng: jax.random.PRNGKey = None,
+        params: Optional[dict] = None,
+        past_key_values: Optional[dict] = None,
+        dropout_rng: Optional[jax.random.PRNGKey] = None,
         train: bool = False,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-        return_dict = return_dict if return_dict is not None else self.config.return_dict
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.return_dict
+        )
 
         batch_size, sequence_length = input_ids.shape
 
         if position_ids is None:
             if past_key_values is not None:
-                raise ValueError("Make sure to provide `position_ids` when passing `past_key_values`.")
+                raise ValueError(
+                    "Make sure to provide `position_ids` when passing `past_key_values`."
+                )
 
-            position_ids = jnp.broadcast_to(jnp.arange(sequence_length)[None, :], (batch_size, sequence_length))
+            position_ids = jnp.broadcast_to(
+                jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
+            )
 
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length))
@@ -767,7 +838,7 @@ class FlaxGPTJPreTrainedModel(FlaxPreTrainedModel):
         # if past_key_values are passed then cache is already initialized a private flag init_cache has to be passed down to ensure cache is used. It has to be made sure that cache is marked as mutable so that it can be changed by FlaxGPTJAttention module
         if past_key_values:
             inputs["cache"] = past_key_values
-            mutable = ["cache"]
+            mutable: Union[List[str], bool] = ["cache"]
         else:
             mutable = False
 
@@ -787,12 +858,12 @@ class FlaxGPTJPreTrainedModel(FlaxPreTrainedModel):
 
         # add updated cache to model output
         if past_key_values is not None and return_dict:
-            outputs, past_key_values = outputs
-            outputs["past_key_values"] = unfreeze(past_key_values["cache"])
+            outputs, past_key_values = outputs  # type: ignore
+            outputs["past_key_values"] = unfreeze(past_key_values["cache"])  # type: ignore
             return outputs
         elif past_key_values is not None and not return_dict:
-            outputs, past_key_values = outputs
-            outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
+            outputs, past_key_values = outputs  # type: ignore
+            outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]  # type: ignore
 
         return outputs
 
@@ -805,14 +876,16 @@ class FlaxGPTJBlockCollection(nn.Module):
         block = FlaxGPTJBlock
         if self.config.gradient_checkpointing:
             FlaxGPT2CheckpointBlock = remat(
-                block, static_argnums=(3, 4, 5),
+                block,
+                static_argnums=(3, 4, 5),
                 policy=get_gradient_checkpoint_policy(
                     self.config.gradient_checkpointing_policy
-                )
+                ),
             )
             block = FlaxGPT2CheckpointBlock
         self.blocks = [
-            block(self.config, name=str(i), dtype=self.dtype) for i in range(self.config.num_hidden_layers)
+            block(self.config, name=str(i), dtype=self.dtype)
+            for i in range(self.config.num_hidden_layers)
         ]
 
     def __call__(
@@ -833,22 +906,25 @@ class FlaxGPTJBlockCollection(nn.Module):
             # Apply forgetful causal mask
             batch_size, seq_length = hidden_states.shape[0], hidden_states.shape[1]
             fcm_ratio = jax.random.uniform(
-                self.make_rng('fcm'), shape=(batch_size, 1, 1, 1),
+                self.make_rng("fcm"),
+                shape=(batch_size, 1, 1, 1),
                 minval=self.config.fcm_min_ratio,
-                maxval=self.config.fcm_max_ratio
+                maxval=self.config.fcm_max_ratio,
             )
-            fcm_mask = jax.random.uniform(
-                self.make_rng('fcm'),
-                shape=(batch_size, 1, seq_length, seq_length)
-            ) > fcm_ratio
+            fcm_mask = (
+                jax.random.uniform(
+                    self.make_rng("fcm"), shape=(batch_size, 1, seq_length, seq_length)
+                )
+                > fcm_ratio
+            )
             fcm_mask = fcm_mask.at[:, :, :, 0].set(True)
-            fcm_mask = fcm_mask.astype('bool')
+            fcm_mask = fcm_mask.astype("bool")
         else:
             fcm_mask = None
 
         for block in self.blocks:
             if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+                all_hidden_states += (hidden_states,)  # type: ignore
 
             layer_outputs = block(
                 hidden_states,
@@ -862,7 +938,7 @@ class FlaxGPTJBlockCollection(nn.Module):
             hidden_states = layer_outputs[0]
 
             if output_attentions:
-                all_attentions += (layer_outputs[1],)
+                all_attentions += (layer_outputs[1],)  # type: ignore
 
         # this contains possible `None` values - `FlaxGPTJModule` will filter them out
         outputs = (hidden_states, all_hidden_states, all_attentions)
@@ -880,13 +956,15 @@ class FlaxGPTJModule(nn.Module):
         self.wte = nn.Embed(
             self.config.vocab_size,
             self.config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            embedding_init=jax.nn.initializers.normal(
+                stddev=self.config.initializer_range
+            ),
         )
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
         self.h = FlaxGPTJBlockCollection(self.config, dtype=self.dtype)
         self.ln_f = nn.LayerNorm(
             epsilon=self.config.layer_norm_epsilon,
-            dtype=jnp.promote_types(self.dtype, jnp.float32)
+            dtype=jnp.promote_types(self.dtype, jnp.float32),
         )
 
     def __call__(
@@ -960,9 +1038,10 @@ class FlaxGPTJForCausalLMModule(nn.Module):
             self.config.vocab_size,
             dtype=self.dtype,
             kernel_init=jax.nn.initializers.variance_scaling(
-                scale=1.0, mode='fan_in',
-                distribution='normal',
-            )
+                scale=1.0,
+                mode="fan_in",
+                distribution="normal",
+            ),
         )
 
     def __call__(
@@ -982,7 +1061,7 @@ class FlaxGPTJForCausalLMModule(nn.Module):
         if position_ids is None:
             position_ids = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, seq_length)
+                (batch_size, seq_length),
             )
 
         outputs = self.transformer(
@@ -1000,14 +1079,20 @@ class FlaxGPTJForCausalLMModule(nn.Module):
 
         if self.config.tie_word_embeddings:
             shared_kernel = self.transformer.variables["params"]["wte"]["embedding"].T
-            lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
+            lm_logits = self.lm_head.apply(
+                {"params": {"kernel": shared_kernel}}, hidden_states
+            )
         else:
             lm_logits = self.lm_head(hidden_states)
 
         if not return_dict:
             return (lm_logits,) + outputs[1:]
 
-        return FlaxCausalLMOutput(logits=lm_logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions)
+        return FlaxCausalLMOutput(
+            logits=lm_logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
 
 @add_start_docstrings(
@@ -1019,7 +1104,9 @@ class FlaxGPTJForCausalLMModule(nn.Module):
 class FlaxGPTJForCausalLM(FlaxGPTJPreTrainedModel):
     module_class = FlaxGPTJForCausalLMModule
 
-    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jnp.DeviceArray] = None):
+    def prepare_inputs_for_generation(
+        self, input_ids, max_length, attention_mask: Optional[jnp.DeviceArray] = None
+    ):
         # initializing the cache
         batch_size, seq_length = input_ids.shape
 
@@ -1030,9 +1117,13 @@ class FlaxGPTJForCausalLM(FlaxGPTJPreTrainedModel):
         extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
         if attention_mask is not None:
             position_ids = attention_mask.cumsum(axis=-1) - 1
-            extended_attention_mask = lax.dynamic_update_slice(extended_attention_mask, attention_mask, (0, 0))
+            extended_attention_mask = lax.dynamic_update_slice(
+                extended_attention_mask, attention_mask, (0, 0)
+            )
         else:
-            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length))
+            position_ids = jnp.broadcast_to(
+                jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length)
+            )
 
         return {
             "past_key_values": past_key_values,

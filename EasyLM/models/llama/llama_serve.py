@@ -1,31 +1,35 @@
-import pprint
 from functools import partial
-
-import numpy as np
-import mlxu
 
 import jax
 import jax.numpy as jnp
+import mlxu
+import numpy as np
+import optax
+from EasyLM.checkpoint import StreamingCheckpointer
+from EasyLM.jax_utils import (
+    FlaxTemperatureLogitsWarper,
+    JaxDistributedConfig,
+    JaxRNG,
+    get_float_dtype_by_name,
+    make_shard_and_gather_fns,
+    match_partition_rules,
+    next_rng,
+    set_random_seed,
+    tree_apply,
+    with_sharding_constraint,
+)
+from EasyLM.models.llama.llama_model import FlaxLLaMAForCausalLM, LLaMAConfig
+from EasyLM.serving import LMServer
 from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec as PS
-import optax
-from transformers import GenerationConfig, FlaxLogitsProcessorList
-
-from EasyLM.checkpoint import StreamingCheckpointer
-from EasyLM.serving import LMServer
-from EasyLM.jax_utils import (
-    JaxRNG, JaxDistributedConfig, next_rng, match_partition_rules, tree_apply,
-    set_random_seed, get_float_dtype_by_name, make_shard_and_gather_fns,
-    with_sharding_constraint, FlaxTemperatureLogitsWarper
-)
-from EasyLM.models.llama.llama_model import LLaMAConfig, FlaxLLaMAForCausalLM
+from transformers import FlaxLogitsProcessorList, GenerationConfig
 
 
 FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     seed=42,
     initialize_jax_distributed=False,
-    mesh_dim='1,-1,1',
-    dtype='bf16',
+    mesh_dim="1,-1,1",
+    dtype="bf16",
     input_length=1024,
     seq_length=2048,
     top_k=50,
@@ -33,8 +37,8 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     do_sample=True,
     num_beams=1,
     add_bos_token=True,
-    load_llama_config='',
-    load_checkpoint='',
+    load_llama_config="",
+    load_checkpoint="",
     tokenizer=LLaMAConfig.get_tokenizer_config(),
     lm_server=LMServer.get_default_config(),
     jax_distributed=JaxDistributedConfig.get_default_config(),
@@ -46,10 +50,10 @@ def main(argv):
     set_random_seed(FLAGS.seed)
 
     prefix_tokenizer = LLaMAConfig.get_tokenizer(
-        FLAGS.tokenizer, truncation_side='left', padding_side='left'
+        FLAGS.tokenizer, truncation_side="left", padding_side="left"
     )
     tokenizer = LLaMAConfig.get_tokenizer(
-        FLAGS.tokenizer, truncation_side='right', padding_side='right'
+        FLAGS.tokenizer, truncation_side="right", padding_side="right"
     )
 
     with jax.default_device(jax.devices("cpu")[0]):
@@ -62,32 +66,31 @@ def main(argv):
             llama_config,
             input_shape=(1, FLAGS.seq_length),
             seed=FLAGS.seed,
-            _do_init=False
+            _do_init=False,
         )
 
-    model_ps = match_partition_rules(
-        LLaMAConfig.get_partition_rules(), params
-    )
+    model_ps = match_partition_rules(LLaMAConfig.get_partition_rules(), params)
     shard_fns, _ = make_shard_and_gather_fns(
         model_ps, get_float_dtype_by_name(FLAGS.dtype)
     )
 
     @partial(
-        pjit,
-        in_shardings=(model_ps, PS(), PS()),
-        out_shardings=(PS(), PS(), PS())
+        pjit, in_shardings=(model_ps, PS(), PS()), out_shardings=(PS(), PS(), PS())
     )
     def forward_loglikelihood(params, rng, batch):
-        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+        batch = with_sharding_constraint(batch, PS(("dp", "fsdp")))
         rng_generator = JaxRNG(rng)
-        input_tokens = batch['input_tokens']
-        output_tokens = batch['output_tokens']
-        input_mask = batch['input_mask']
-        output_mask = batch['output_mask']
+        input_tokens = batch["input_tokens"]
+        output_tokens = batch["output_tokens"]
+        input_mask = batch["input_mask"]
+        output_mask = batch["output_mask"]
 
         logits = hf_model.module.apply(
-            params, input_tokens, attention_mask=input_mask,
-            deterministic=True, rngs=rng_generator(llama_config.rng_keys()),
+            params,
+            input_tokens,
+            attention_mask=input_mask,
+            deterministic=True,
+            rngs=rng_generator(llama_config.rng_keys()),
         ).logits
         # if llama_config.n_real_tokens is not None:
         #   logits = logits.at[:, :, llama_config.n_real_tokens:].set(-1e8)
@@ -96,26 +99,22 @@ def main(argv):
         )
         loglikelihood = jnp.sum(loglikelihood * output_mask, axis=-1)
         match_count = jnp.sum(
-            (jnp.argmax(logits, axis=-1) == output_tokens) * output_mask,
-            axis=-1
+            (jnp.argmax(logits, axis=-1) == output_tokens) * output_mask, axis=-1
         )
         total = jnp.sum(output_mask, axis=-1)
         is_greedy = match_count == total
         return loglikelihood, is_greedy, rng_generator()
 
-
     @partial(
-        pjit,
-        in_shardings=(model_ps, PS(), PS(), PS()),
-        out_shardings=(PS(), PS())
+        pjit, in_shardings=(model_ps, PS(), PS(), PS()), out_shardings=(PS(), PS())
     )
     def forward_generate(params, rng, batch, temperature):
-        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+        batch = with_sharding_constraint(batch, PS(("dp", "fsdp")))
         rng_generator = JaxRNG(rng)
         output = hf_model.generate(
-            batch['input_tokens'],
-            attention_mask=batch['attention_mask'],
-            params=params['params'],
+            batch["input_tokens"],
+            attention_mask=batch["attention_mask"],
+            params=params["params"],
             prng_key=rng_generator(),
             logits_processor=FlaxLogitsProcessorList(
                 [FlaxTemperatureLogitsWarper(temperature)]
@@ -129,22 +128,18 @@ def main(argv):
                 num_beams=FLAGS.num_beams,
                 top_k=FLAGS.top_k,
                 top_p=FLAGS.top_p,
-            )
-        ).sequences[:, batch['input_tokens'].shape[1]:]
+            ),
+        ).sequences[:, batch["input_tokens"].shape[1] :]
         return output, rng_generator()
 
-    @partial(
-        pjit,
-        in_shardings=(model_ps, PS(), PS()),
-        out_shardings=(PS(), PS())
-    )
+    @partial(pjit, in_shardings=(model_ps, PS(), PS()), out_shardings=(PS(), PS()))
     def forward_greedy_generate(params, rng, batch):
-        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+        batch = with_sharding_constraint(batch, PS(("dp", "fsdp")))
         rng_generator = JaxRNG(rng)
         output = hf_model.generate(
-            batch['input_tokens'],
-            attention_mask=batch['attention_mask'],
-            params=params['params'],
+            batch["input_tokens"],
+            attention_mask=batch["attention_mask"],
+            params=params["params"],
             prng_key=rng_generator(),
             generation_config=GenerationConfig(
                 max_new_tokens=FLAGS.seq_length - FLAGS.input_length,
@@ -153,8 +148,8 @@ def main(argv):
                 eos_token_id=tokenizer.eos_token_id,
                 do_sample=False,
                 num_beams=1,
-            )
-        ).sequences[:, batch['input_tokens'].shape[1]:]
+            ),
+        ).sequences[:, batch["input_tokens"].shape[1] :]
         return output, rng_generator()
 
     mesh = LLaMAConfig.get_jax_mesh(FLAGS.mesh_dim)
@@ -163,23 +158,22 @@ def main(argv):
         sharded_rng = next_rng()
 
     class ModelServer(LMServer):
-
         @staticmethod
         def loglikelihood(prefix_text, text):
             nonlocal sharded_rng
             prefix = prefix_tokenizer(
                 prefix_text,
-                padding='max_length',
+                padding="max_length",
                 truncation=True,
                 max_length=FLAGS.input_length,
-                return_tensors='np',
+                return_tensors="np",
             )
             inputs = tokenizer(
                 text,
-                padding='max_length',
+                padding="max_length",
                 truncation=True,
                 max_length=FLAGS.seq_length - FLAGS.input_length,
-                return_tensors='np',
+                return_tensors="np",
             )
             output_tokens = np.concatenate([prefix.input_ids, inputs.input_ids], axis=1)
             bos_tokens = np.full(
@@ -216,10 +210,10 @@ def main(argv):
             nonlocal sharded_rng
             inputs = tokenizer(
                 text,
-                padding='longest',
+                padding="longest",
                 truncation=False,
                 max_length=np.iinfo(np.int32).max,
-                return_tensors='np',
+                return_tensors="np",
             )
             batch_size = inputs.input_ids.shape[0]
             output_tokens = inputs.input_ids
@@ -240,7 +234,7 @@ def main(argv):
                 (batch_size, 1), tokenizer.bos_token_id, dtype=np.int32
             )
             input_tokens = np.concatenate([bos_tokens, output_tokens[:, :-1]], axis=-1)
-            bos_mask = np.ones((batch_size, 1), dtype=inputs.attention_mask.dtype)
+            _bos_mask = np.ones((batch_size, 1), dtype=inputs.attention_mask.dtype)
             total_seq_length = output_tokens.shape[1]
 
             total_loglikelihood = 0.0
@@ -249,30 +243,32 @@ def main(argv):
             for i in range(0, total_seq_length, FLAGS.seq_length):
                 # Last window
                 if i + FLAGS.seq_length > total_seq_length:
-                    last_output_mask = np.copy(attention_mask[:, -FLAGS.seq_length:])
-                    last_output_mask[:, :i - total_seq_length] = 0.0
+                    last_output_mask = np.copy(attention_mask[:, -FLAGS.seq_length :])
+                    last_output_mask[:, : i - total_seq_length] = 0.0
 
                     batch = dict(
-                        input_tokens=input_tokens[:, -FLAGS.seq_length:],
-                        output_tokens=output_tokens[:, -FLAGS.seq_length:],
-                        input_mask=attention_mask[:, -FLAGS.seq_length:],
+                        input_tokens=input_tokens[:, -FLAGS.seq_length :],
+                        output_tokens=output_tokens[:, -FLAGS.seq_length :],
+                        input_mask=attention_mask[:, -FLAGS.seq_length :],
                         output_mask=last_output_mask,
                     )
 
                 # Normal window
                 else:
                     batch = dict(
-                        input_tokens=input_tokens[:, i:i + FLAGS.seq_length],
-                        output_tokens=output_tokens[:, i:i + FLAGS.seq_length],
-                        input_mask=attention_mask[:, i:i + FLAGS.seq_length],
-                        output_mask=attention_mask[:, i:i + FLAGS.seq_length],
+                        input_tokens=input_tokens[:, i : i + FLAGS.seq_length],
+                        output_tokens=output_tokens[:, i : i + FLAGS.seq_length],
+                        input_mask=attention_mask[:, i : i + FLAGS.seq_length],
+                        output_mask=attention_mask[:, i : i + FLAGS.seq_length],
                     )
 
                 with mesh:
                     loglikelihood, is_greedy, sharded_rng = forward_loglikelihood(
                         params, sharded_rng, batch
                     )
-                    loglikelihood, is_greedy = jax.device_get((loglikelihood, is_greedy))
+                    loglikelihood, is_greedy = jax.device_get(
+                        (loglikelihood, is_greedy)
+                    )
 
                 total_loglikelihood += loglikelihood
                 total_is_greedy = np.logical_and(is_greedy, total_is_greedy)
@@ -284,10 +280,10 @@ def main(argv):
             nonlocal sharded_rng
             inputs = prefix_tokenizer(
                 text,
-                padding='max_length',
+                padding="max_length",
                 truncation=True,
                 max_length=FLAGS.input_length,
-                return_tensors='np',
+                return_tensors="np",
             )
             input_tokens = inputs.input_ids
             input_mask = inputs.attention_mask
@@ -319,7 +315,7 @@ def main(argv):
                 if isinstance(ut, str):
                     ut = [ut]
                 total_length = 0
-                total_generated = ''
+                total_generated = ""
 
                 while total_length < max_length:
                     pf_tokens = tokenizer(
@@ -327,7 +323,7 @@ def main(argv):
                         padding=False,
                         truncation=False,
                         max_length=np.iinfo(np.int32).max,
-                        return_tensors='np',
+                        return_tensors="np",
                     )
                     input_tokens = pf_tokens.input_ids
                     attention_mask = pf_tokens.attention_mask
@@ -345,14 +341,16 @@ def main(argv):
                             [pad_attention, attention_mask], axis=1
                         )
                     elif input_tokens.shape[1] > FLAGS.input_length:
-                        input_tokens = input_tokens[:, -FLAGS.input_length:]
-                        attention_mask = attention_mask[:, -FLAGS.input_length:]
+                        input_tokens = input_tokens[:, -FLAGS.input_length :]
+                        attention_mask = attention_mask[:, -FLAGS.input_length :]
 
                     if FLAGS.add_bos_token:
                         input_tokens[:, 0] = tokenizer.bos_token_id
                         attention_mask[:, 0] = 1
 
-                    batch = dict(input_tokens=input_tokens, attention_mask=attention_mask)
+                    batch = dict(
+                        input_tokens=input_tokens, attention_mask=attention_mask
+                    )
 
                     with mesh:
                         output, sharded_rng = forward_greedy_generate(
@@ -376,7 +374,6 @@ def main(argv):
                 all_outputs.append(total_generated)
 
             return all_outputs
-
 
     server = ModelServer(FLAGS.lm_server)
     server.run()

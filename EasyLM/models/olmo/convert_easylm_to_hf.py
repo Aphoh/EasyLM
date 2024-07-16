@@ -23,19 +23,18 @@ import os
 import shutil
 
 import mlxu
-from flax.traverse_util import flatten_dict
 import torch
-from transformers import OlmoConfig, OlmoForCausalLM, AutoTokenizer
-
 from EasyLM.checkpoint import StreamingCheckpointer
 from EasyLM.jax_utils import float_tensor_to_dtype
+from flax.traverse_util import flatten_dict
+from transformers import AutoTokenizer, OlmoConfig, OlmoForCausalLM
 
 
 FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
-    load_checkpoint='',
-    tokenizer_path='',
-    model_size='7b',
-    output_dir='',
+    load_checkpoint="",
+    tokenizer_path="",
+    model_size="7b",
+    output_dir="",
     is_reward_model=False,
 )
 
@@ -49,7 +48,7 @@ OLMO_STANDARD_CONFIGS = {
         "norm_eps": 1e-5,
         "rope_theta": 10000.0,
     },
-     "17_7b": {
+    "17_7b": {
         "dim": 4096,
         "intermediate_size": 11008,
         "n_layers": 32,
@@ -76,13 +75,13 @@ def match_keywords(string, positives, negatives):
 
 def load_and_convert_checkpoint(path):
     _, flax_params = StreamingCheckpointer.load_trainstate_checkpoint(path)
-    flax_params = flatten_dict(flax_params['params'], sep='.')
+    flax_params = flatten_dict(flax_params["params"], sep=".")
     torch_params = {}
     for key, tensor in flax_params.items():
-        if match_keywords(key, ["kernel"], ["norm", 'ln_f']):
+        if match_keywords(key, ["kernel"], ["norm", "ln_f"]):
             tensor = tensor.T
         torch_params[key] = torch.tensor(
-            float_tensor_to_dtype(tensor, 'fp32'), dtype=torch.bfloat16
+            float_tensor_to_dtype(tensor, "fp32"), dtype=torch.bfloat16
         )
     return torch_params
 
@@ -106,36 +105,48 @@ def write_model(loaded, model_path, model_size, is_reward_model=False):
 
     n_layers = params["n_layers"]
     n_heads = params["n_heads"]
-    n_kv_heads = params.get("n_kv_heads", n_heads)
+    _n_kv_heads = params.get("n_kv_heads", n_heads)
     dim = params["dim"]
     dims_per_head = dim // n_heads
     base = 10000.0
-    inv_freq = 1.0 / (base ** (torch.arange(0, dims_per_head, 2).float() / dims_per_head))
+    _inv_freq = 1.0 / (
+        base ** (torch.arange(0, dims_per_head, 2).float() / dims_per_head)
+    )
 
     # permute for sliced rotary
-    def permute(w):
-        return w.view(n_heads, dim // n_heads // 2, 2, dim).transpose(1, 2).reshape(dim, dim)
-    
-    # gqa means we need a slightly diff permute for the k_proj
-    def permute_gqa(w):
-        return w.view(n_kv_heads, dims_per_head // 2, 2, dim).transpose(1, 2).reshape(dims_per_head * n_kv_heads, dim)
+    # def permute(w):
+    #    return w.view(n_heads, dim // n_heads // 2, 2, dim).transpose(1, 2).reshape(dim, dim)
 
+    ## gqa means we need a slightly diff permute for the k_proj
+    # def permute_gqa(w):
+    #    return w.view(n_kv_heads, dims_per_head // 2, 2, dim).transpose(1, 2).reshape(dims_per_head * n_kv_heads, dim)
 
     param_count = 0
     index_dict = {"weight_map": {}}
     for layer_i in range(n_layers):
         filename = f"pytorch_model-{layer_i + 1}-of-{n_layers + 1}.bin"
         state_dict = {
-            f"model.layers.{layer_i}.self_attn.q_proj.weight":
-                loaded[f"transformer.h.{layer_i}.attention.wq.kernel"],
-            f"model.layers.{layer_i}.self_attn.k_proj.weight":
-                loaded[f"transformer.h.{layer_i}.attention.wk.kernel"],
-            f"model.layers.{layer_i}.self_attn.v_proj.weight": loaded[f"transformer.h.{layer_i}.attention.wv.kernel"],
-            f"model.layers.{layer_i}.self_attn.o_proj.weight": loaded[f"transformer.h.{layer_i}.attention.wo.kernel"],
-
-            f"model.layers.{layer_i}.mlp.up_proj.weight": loaded[f"transformer.h.{layer_i}.feed_forward.w1.kernel"],
-            f"model.layers.{layer_i}.mlp.down_proj.weight": loaded[f"transformer.h.{layer_i}.feed_forward.w2.kernel"],
-            f"model.layers.{layer_i}.mlp.gate_proj.weight": loaded[f"transformer.h.{layer_i}.feed_forward.w3.kernel"],
+            f"model.layers.{layer_i}.self_attn.q_proj.weight": loaded[
+                f"transformer.h.{layer_i}.attention.wq.kernel"
+            ],
+            f"model.layers.{layer_i}.self_attn.k_proj.weight": loaded[
+                f"transformer.h.{layer_i}.attention.wk.kernel"
+            ],
+            f"model.layers.{layer_i}.self_attn.v_proj.weight": loaded[
+                f"transformer.h.{layer_i}.attention.wv.kernel"
+            ],
+            f"model.layers.{layer_i}.self_attn.o_proj.weight": loaded[
+                f"transformer.h.{layer_i}.attention.wo.kernel"
+            ],
+            f"model.layers.{layer_i}.mlp.up_proj.weight": loaded[
+                f"transformer.h.{layer_i}.feed_forward.w1.kernel"
+            ],
+            f"model.layers.{layer_i}.mlp.down_proj.weight": loaded[
+                f"transformer.h.{layer_i}.feed_forward.w2.kernel"
+            ],
+            f"model.layers.{layer_i}.mlp.gate_proj.weight": loaded[
+                f"transformer.h.{layer_i}.feed_forward.w3.kernel"
+            ],
         }
         for k, v in state_dict.items():
             index_dict["weight_map"][k] = filename
@@ -149,13 +160,17 @@ def write_model(loaded, model_path, model_size, is_reward_model=False):
     }
     # if reward model, we have the score head instead of the lm head
     if is_reward_model:
-        state_dict.update({
-            "score.weight": loaded["score.kernel"],
-        })
+        state_dict.update(
+            {
+                "score.weight": loaded["score.kernel"],
+            }
+        )
     else:
-        state_dict.update({
-            "lm_head.weight": loaded["lm_head.kernel"],
-        })
+        state_dict.update(
+            {
+                "lm_head.weight": loaded["lm_head.kernel"],
+            }
+        )
 
     for k, v in state_dict.items():
         index_dict["weight_map"][k] = filename
@@ -188,7 +203,9 @@ def write_model(loaded, model_path, model_size, is_reward_model=False):
     if is_reward_model:
         raise ValueError("OlmoForSequenceClassifier does not exist yet.")
     else:
-        model = OlmoForCausalLM.from_pretrained(tmp_model_path, torch_dtype=torch.bfloat16)
+        model = OlmoForCausalLM.from_pretrained(
+            tmp_model_path, torch_dtype=torch.bfloat16
+        )
     # Avoid saving this as part of the config.
     del model.config._name_or_path
 
@@ -196,8 +213,13 @@ def write_model(loaded, model_path, model_size, is_reward_model=False):
     model.save_pretrained(model_path)
     shutil.rmtree(tmp_model_path)
 
+
 def main(argv):
-    assert FLAGS.load_checkpoint != "" and FLAGS.output_dir != "" and FLAGS.tokenizer_path != ""
+    assert (
+        FLAGS.load_checkpoint != ""
+        and FLAGS.output_dir != ""
+        and FLAGS.tokenizer_path != ""
+    )
     assert FLAGS.model_size in OLMO_STANDARD_CONFIGS
     # just use the hf tokenizer
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer_path)

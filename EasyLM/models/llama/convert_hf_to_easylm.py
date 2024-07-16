@@ -6,30 +6,31 @@ python convert_hf_to_easylm.py  \
        --model_size 7b \
        --streaming
 """
+
+import argparse
 import time
 from pathlib import Path
-import argparse
 
+import flax
 import mlxu
 import torch
-import flax
-
 from EasyLM.checkpoint import StreamingCheckpointer
 
+
 LLAMA_STANDARD_CONFIGS = {
-    '1b': {
-        'dim': 2048,
-        'intermediate_size': 5504,
-        'n_layers': 22,
-        'n_heads': 16,
-        'norm_eps': 1e-6,
+    "1b": {
+        "dim": 2048,
+        "intermediate_size": 5504,
+        "n_layers": 22,
+        "n_heads": 16,
+        "norm_eps": 1e-6,
     },
-    '3b': {
-        'dim': 3200,
-        'intermediate_size': 8640,
-        'n_layers': 26,
-        'n_heads': 32,
-        'norm_eps': 1e-6,
+    "3b": {
+        "dim": 3200,
+        "intermediate_size": 8640,
+        "n_layers": 26,
+        "n_heads": 32,
+        "norm_eps": 1e-6,
     },
     "7b": {
         "dim": 4096,
@@ -71,7 +72,7 @@ LLAMA_STANDARD_CONFIGS = {
 
 
 def inverse_permute(params, w):
-    n_layers = params["n_layers"]
+    _n_layers = params["n_layers"]
     n_heads = params["n_heads"]
     dim = params["dim"]
     reshaped_w = w.reshape(n_heads, 2, dim // n_heads // 2, dim)
@@ -81,7 +82,7 @@ def inverse_permute(params, w):
 
 
 def inverse_permute_kv(params, w):
-    n_layers = params["n_layers"]
+    _n_layers = params["n_layers"]
     n_kv_heads = params["n_kv_heads"]
     n_heads = params["n_heads"]
     dim = params["dim"]
@@ -103,25 +104,28 @@ def main(args):
             if k.startswith("model."):
                 k = k[6:]
             ckpt[k] = v
-    print(f"Start convert weight to easylm format...")
+    print("Start convert weight to easylm format...")
     jax_weights = {
         "transformer": {
             "wte": {"embedding": ckpt["embed_tokens.weight"].to(torch.float32).numpy()},
             "ln_f": {"kernel": ckpt["norm.weight"].to(torch.float32).numpy()},
             "h": {
-                "%d"
-                % (layer): {
+                "%d" % (layer): {
                     "attention": {
                         "wq": {
                             "kernel": inverse_permute(
                                 params,
-                                ckpt[f"layers.{layer}.self_attn.q_proj.weight"].to(torch.float32).numpy(),
+                                ckpt[f"layers.{layer}.self_attn.q_proj.weight"]
+                                .to(torch.float32)
+                                .numpy(),
                             ).transpose()
                         },
                         "wk": {
                             "kernel": inverse_permute_kv(
                                 params,
-                                ckpt[f"layers.{layer}.self_attn.k_proj.weight"].to(torch.float32).numpy(),
+                                ckpt[f"layers.{layer}.self_attn.k_proj.weight"]
+                                .to(torch.float32)
+                                .numpy(),
                             )
                         },
                         "wv": {
@@ -158,21 +162,27 @@ def main(args):
                         },
                     },
                     "attention_norm": {
-                        "kernel": ckpt[f"layers.{layer}.input_layernorm.weight"].to(torch.float32).numpy()
+                        "kernel": ckpt[f"layers.{layer}.input_layernorm.weight"]
+                        .to(torch.float32)
+                        .numpy()
                     },
                     "ffn_norm": {
                         "kernel": ckpt[
                             f"layers.{layer}.post_attention_layernorm.weight"
-                        ].to(torch.float32).numpy()
+                        ]
+                        .to(torch.float32)
+                        .numpy()
                     },
                 }
                 for layer in range(params["n_layers"])
             },
         },
-        "lm_head": {"kernel": ckpt["lm_head.weight"].to(torch.float32).numpy().transpose()},
+        "lm_head": {
+            "kernel": ckpt["lm_head.weight"].to(torch.float32).numpy().transpose()
+        },
     }
-    print(f"Convert weight to easylm format finished...")
-    print(f"Start to save...")
+    print("Convert weight to easylm format finished...")
+    print("Start to save...")
 
     if args.streaming:
         StreamingCheckpointer.save_train_state_to_file(jax_weights, args.output_file)

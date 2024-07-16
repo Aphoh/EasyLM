@@ -1,0 +1,10 @@
+[tools.pyright.python]
+disableTaggedHints = true
+
+[tool.pyright]
+venv = "venv"
+venvPath = "."
+
+[tool.mypy]
+ignore_missing_imports = true
+files = ["EasyLM/**/*.py", "conversion_scripts/**/*.py"]

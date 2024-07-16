@@ -6,18 +6,17 @@ python convert_hf_to_easylm.py  \
        --model_size 7b \
        --streaming
 """
+
+import argparse
 import time
 from pathlib import Path
-import argparse
 
+import flax
 import mlxu
 import torch
-import flax
-from safetensors import safe_open
-from safetensors.torch import save_file
-from tqdm import tqdm
-
 from EasyLM.checkpoint import StreamingCheckpointer
+from safetensors import safe_open
+
 
 LLAMA_STANDARD_CONFIGS = {
     "7b": {
@@ -34,19 +33,19 @@ def main(args):
     start = time.time()
     params = LLAMA_STANDARD_CONFIGS[args.model_size]
 
-    remove_prefix = 'model.transformer.' if not args.hf_format_convert else 'model.'
+    remove_prefix = "model.transformer." if not args.hf_format_convert else "model."
     if args.use_safetensors:
         ckpt_paths = sorted(Path(args.checkpoint_dir).glob("*.safetensors"))
         ckpt = {}
-        
+
         for i in range(len(ckpt_paths)):
             with safe_open(ckpt_paths[i], framework="pt", device="cpu") as f:
                 for key in f.keys():
                     if key.startswith(remove_prefix):
-                        k = key[len(remove_prefix):]
+                        k = key[len(remove_prefix) :]
                     else:
                         k = key
-                    ckpt[k] = f.get_tensor(key)    
+                    ckpt[k] = f.get_tensor(key)
     else:
         ckpt_paths = sorted(Path(args.checkpoint_dir).glob("*.bin"))
         ckpt = {}
@@ -54,26 +53,33 @@ def main(args):
             checkpoint = torch.load(ckpt_path, map_location="cpu")
             for k, v in checkpoint.items():
                 if k.startswith(remove_prefix):
-                    k = k[len(remove_prefix):]
+                    k = k[len(remove_prefix) :]
                 ckpt[k] = v
-    print(f"Start convert weight to easylm format...")
+    print("Start convert weight to easylm format...")
     if not args.hf_format_convert:
         jax_weights = {
             "transformer": {
                 "wte": {"embedding": ckpt["wte.weight"].to(torch.float32).numpy()},
                 "h": {
-                    "%d"
-                    % (layer): {
+                    "%d" % (layer): {
                         "attention": {
                             "wq": {
-                                "kernel": ckpt[f"blocks.{layer}.att_proj.weight"].chunk(3)[0].to(torch.float32).numpy().transpose()
+                                "kernel": ckpt[f"blocks.{layer}.att_proj.weight"]
+                                .chunk(3)[0]
+                                .to(torch.float32)
+                                .numpy()
+                                .transpose()
                             },
                             "wk": {
-                                "kernel": ckpt[f"blocks.{layer}.att_proj.weight"].chunk(3)[1].to(torch.float32).numpy().transpose()
-                                
+                                "kernel": ckpt[f"blocks.{layer}.att_proj.weight"]
+                                .chunk(3)[1]
+                                .to(torch.float32)
+                                .numpy()
+                                .transpose()
                             },
                             "wv": {
-                                "kernel": ckpt[f"blocks.{layer}.att_proj.weight"].chunk(3)[2]
+                                "kernel": ckpt[f"blocks.{layer}.att_proj.weight"]
+                                .chunk(3)[2]
                                 .to(torch.float32)
                                 .numpy()
                                 .transpose()
@@ -87,7 +93,8 @@ def main(args):
                         },
                         "feed_forward": {
                             "w1": {
-                                "kernel": ckpt[f"blocks.{layer}.ff_proj.weight"].chunk(2)[0]
+                                "kernel": ckpt[f"blocks.{layer}.ff_proj.weight"]
+                                .chunk(2)[0]
                                 .to(torch.float32)
                                 .numpy()
                                 .transpose()
@@ -99,7 +106,8 @@ def main(args):
                                 .transpose()
                             },
                             "w3": {
-                                "kernel": ckpt[f"blocks.{layer}.ff_proj.weight"].chunk(2)[1]
+                                "kernel": ckpt[f"blocks.{layer}.ff_proj.weight"]
+                                .chunk(2)[1]
                                 .to(torch.float32)
                                 .numpy()
                                 .transpose()
@@ -109,31 +117,47 @@ def main(args):
                     for layer in range(params["n_layers"])
                 },
             },
-            "lm_head": {"kernel": ckpt["ff_out.weight"].to(torch.float32).numpy().transpose()},
+            "lm_head": {
+                "kernel": ckpt["ff_out.weight"].to(torch.float32).numpy().transpose()
+            },
         }
     else:
         jax_weights = {
             "transformer": {
-                "wte": {"embedding": ckpt["embed_tokens.weight"].to(torch.float32).numpy()},
+                "wte": {
+                    "embedding": ckpt["embed_tokens.weight"].to(torch.float32).numpy()
+                },
                 "h": {
-                    "%d"
-                    % (layer): {
+                    "%d" % (layer): {
                         "attention": {
                             "wq": {
-                                "kernel": ckpt[f"layers.{layer}.self_attn.q_proj.weight"].to(torch.float32).numpy().transpose()
+                                "kernel": ckpt[
+                                    f"layers.{layer}.self_attn.q_proj.weight"
+                                ]
+                                .to(torch.float32)
+                                .numpy()
+                                .transpose()
                             },
                             "wk": {
-                                "kernel": ckpt[f"layers.{layer}.self_attn.k_proj.weight"].to(torch.float32).numpy().transpose()
-                                
+                                "kernel": ckpt[
+                                    f"layers.{layer}.self_attn.k_proj.weight"
+                                ]
+                                .to(torch.float32)
+                                .numpy()
+                                .transpose()
                             },
                             "wv": {
-                                "kernel": ckpt[f"layers.{layer}.self_attn.v_proj.weight"]
+                                "kernel": ckpt[
+                                    f"layers.{layer}.self_attn.v_proj.weight"
+                                ]
                                 .to(torch.float32)
                                 .numpy()
                                 .transpose()
                             },
                             "wo": {
-                                "kernel": ckpt[f"layers.{layer}.self_attn.o_proj.weight"]
+                                "kernel": ckpt[
+                                    f"layers.{layer}.self_attn.o_proj.weight"
+                                ]
                                 .to(torch.float32)
                                 .numpy()
                                 .transpose()
@@ -163,10 +187,12 @@ def main(args):
                     for layer in range(params["n_layers"])
                 },
             },
-            "lm_head": {"kernel": ckpt["lm_head.weight"].to(torch.float32).numpy().transpose()},
+            "lm_head": {
+                "kernel": ckpt["lm_head.weight"].to(torch.float32).numpy().transpose()
+            },
         }
-    print(f"Convert weight to easylm format finished...")
-    print(f"Start to save...")
+    print("Convert weight to easylm format finished...")
+    print("Start to save...")
 
     if args.streaming:
         StreamingCheckpointer.save_train_state_to_file(jax_weights, args.output_file)
